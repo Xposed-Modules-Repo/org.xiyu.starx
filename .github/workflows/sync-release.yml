@@ -1,3 +1,128 @@
+name: Sync Release from Mai-xiyu/StarX
+
+on:
+  schedule:
+    - cron: '0 * * * *'       # 每小时整点触发
+  workflow_dispatch:           # 允许手动触发
+  repository_dispatch:
+    types: [starx_release]    # 可被其他仓库主动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch latest release from Mai-xiyu/StarX (public)
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::group::Fetching latest release"
+
+          RESPONSE=$(curl -sf \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Mai-xiyu/StarX/releases/latest") || {
+            echo "No release found or API error"
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          UPSTREAM_TAG=$(echo "$RESPONSE" | jq -r '.tag_name')
+          UPSTREAM_NAME=$(echo "$RESPONSE" | jq -r '.name')
+          UPSTREAM_BODY=$(echo "$RESPONSE" | jq -r '.body')
+          ASSET_URL=$(echo "$RESPONSE" | jq -r '[.assets[] | select(.name | endswith(".apk"))][0].browser_download_url // .assets[0].browser_download_url // empty')
+          ASSET_NAME=$(echo "$RESPONSE" | jq -r '[.assets[] | select(.name | endswith(".apk"))][0].name // .assets[0].name // empty')
+
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "No valid upstream tag"
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Upstream tag: $UPSTREAM_TAG"
+          echo "Asset: $ASSET_NAME"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_name=$UPSTREAM_NAME" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$ASSET_URL" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          {
+            echo "upstream_body<<BODY_EOF"
+            echo "$UPSTREAM_BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::endgroup::"
+
+          echo "::group::Checking existing release on this repo"
+          EXIST=$(curl -sf \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${UPSTREAM_TAG}" 2>/dev/null || true)
+          if [ -n "$EXIST" ] && [ "$(echo "$EXIST" | jq -r '.id // empty')" != "" ]; then
+            echo "Tag $UPSTREAM_TAG already exists, skipping"
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "New release: $UPSTREAM_TAG"
+          echo "has_new=true" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Download release asset
+        if: steps.fetch.outputs.has_new == 'true' && steps.fetch.outputs.asset_url != ''
+        run: |
+          curl -L \
+            -H "Accept: application/octet-stream" \
+            "${{ steps.fetch.outputs.asset_url }}" \
+            -o "${{ steps.fetch.outputs.asset_name }}"
+          ls -lh "${{ steps.fetch.outputs.asset_name }}"
+
+      - name: Create tag and release
+        if: steps.fetch.outputs.has_new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.fetch.outputs.upstream_tag }}"
+          NAME="${{ steps.fetch.outputs.upstream_name }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git tag "$TAG"
+          fi
+          git push origin "$TAG" 2>/dev/null || true
+
+          RELEASE_RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases" \
+            -d "$(jq -n \
+              --arg tag "$TAG" \
+              --arg name "$NAME" \
+              --arg body "${{ steps.fetch.outputs.upstream_body }}" \
+              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')")
+
+          RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
+          echo "Created release ID: $RELEASE_ID"
+
+          ASSET_FILE="${{ steps.fetch.outputs.asset_name }}"
+          if [ -f "$ASSET_FILE" ]; then
+            echo "Uploading $ASSET_FILE"
+            curl -sf -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: application/vnd.android.package-archive" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET_FILE}" \
+              --data-binary "@${ASSET_FILE}"
+            echo "Upload complete"
+          fi
 name: Sync Release from StarX_REPO
 
 on:
